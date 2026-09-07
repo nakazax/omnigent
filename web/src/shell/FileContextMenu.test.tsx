@@ -26,10 +26,15 @@ beforeEach(() => {
   mocks.reveal.mockResolvedValue(true);
 });
 
-function openMenu(hostId = "local", deleted = false, root = "/Users/test/repo/src") {
+function openMenu(
+  hostId = "local",
+  deleted = false,
+  root = "/Users/test/repo/src",
+  path = "nested/file.txt",
+) {
   const view = render(
     <FileMenuProvider root={root} hostId={hostId}>
-      <FileContextMenu path="nested/file.txt" deleted={deleted}>
+      <FileContextMenu path={path} deleted={deleted}>
         <button type="button">File</button>
       </FileContextMenu>
     </FileMenuProvider>,
@@ -118,4 +123,23 @@ it("updates the absolute path after navigating to another directory", () => {
   );
   fireEvent.click(screen.getByRole("menuitem", { name: "Copy Path" }));
   expect(mocks.copy).toHaveBeenCalledWith("/tmp/other/nested/file.txt");
+});
+
+it("reveals absolute viewer paths outside the workspace without prefixing the root", async () => {
+  openMenu("local", false, "/workspace", "/tmp/report.md");
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Show in Finder" }));
+  expect(mocks.reveal).toHaveBeenCalledWith("local", "/tmp/report.md");
+});
+
+it("does not offer a misleading relative path for an outside-workspace file", () => {
+  openMenu("remote", false, "/workspace", "/workspace-other/report.md");
+  expect(screen.queryByRole("menuitem", { name: "Copy Relative Path" })).toBeNull();
+  fireEvent.click(screen.getByRole("menuitem", { name: "Copy Path" }));
+  expect(mocks.copy).toHaveBeenCalledWith("/workspace-other/report.md");
+});
+
+it("copies a workspace-relative path for an absolute viewer path inside it", () => {
+  openMenu("remote", false, "/workspace", "/workspace/docs/report.md");
+  fireEvent.click(screen.getByRole("menuitem", { name: "Copy Relative Path" }));
+  expect(mocks.copy).toHaveBeenCalledWith("docs/report.md");
 });

@@ -1,3 +1,7 @@
+import { FileMenuProvider } from "./FileContextMenu";
+import { copyText } from "@/lib/clipboard";
+
+vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -96,38 +100,40 @@ function renderWorkspace(
   const onToggleMaximized = vi.fn();
   render(
     <TooltipProvider delayDuration={0}>
-      <WorkspacePanel
-        conversationId="conv_ws"
-        width={360}
-        handleProps={{ tabIndex: 0 }}
-        rightRailTab={overrides.rightRailTab ?? "files"}
-        onRightRailTabChange={onRightRailTabChange}
-        showFilesPanel
-        showGithubTab={overrides.showGithubTab ?? false}
-        showBrowserTab={overrides.showBrowserTab ?? false}
-        changedCount={overrides.changedCount ?? 0}
-        subagentsWorking={0}
-        agentCount={1}
-        rootSessionId={null}
-        selectedFilePath={overrides.selectedFilePath ?? null}
-        openFiles={overrides.openFiles ?? []}
-        openFileViewer={openFileViewer}
-        onCloseFile={onCloseFile}
-        onShowScopeView={vi.fn()}
-        onCommentsOpenChange={vi.fn()}
-        openTerminalTab={openTerminalTab}
-        openTerminals={overrides.openTerminals ?? []}
-        selectedTerminalKey={overrides.selectedTerminalKey ?? null}
-        onCloseTerminal={onCloseTerminal}
-        maximized={overrides.maximized ?? false}
-        onToggleMaximized={onToggleMaximized}
-        permissionLevel={null}
-        filesPanelSort={"recent" as ChangedSort}
-        onSortChange={vi.fn()}
-        filesPanelShowHidden={false}
-        onShowHiddenChange={vi.fn()}
-        liveness={overrides.liveness}
-      />
+      <FileMenuProvider root="/workspace" hostId={null}>
+        <WorkspacePanel
+          conversationId="conv_ws"
+          width={360}
+          handleProps={{ tabIndex: 0 }}
+          rightRailTab={overrides.rightRailTab ?? "files"}
+          onRightRailTabChange={onRightRailTabChange}
+          showFilesPanel
+          showGithubTab={overrides.showGithubTab ?? false}
+          showBrowserTab={overrides.showBrowserTab ?? false}
+          changedCount={overrides.changedCount ?? 0}
+          subagentsWorking={0}
+          agentCount={1}
+          rootSessionId={null}
+          selectedFilePath={overrides.selectedFilePath ?? null}
+          openFiles={overrides.openFiles ?? []}
+          openFileViewer={openFileViewer}
+          onCloseFile={onCloseFile}
+          onShowScopeView={vi.fn()}
+          onCommentsOpenChange={vi.fn()}
+          openTerminalTab={openTerminalTab}
+          openTerminals={overrides.openTerminals ?? []}
+          selectedTerminalKey={overrides.selectedTerminalKey ?? null}
+          onCloseTerminal={onCloseTerminal}
+          maximized={overrides.maximized ?? false}
+          onToggleMaximized={onToggleMaximized}
+          permissionLevel={null}
+          filesPanelSort={"recent" as ChangedSort}
+          onSortChange={vi.fn()}
+          filesPanelShowHidden={false}
+          onShowHiddenChange={vi.fn()}
+          liveness={overrides.liveness}
+        />
+      </FileMenuProvider>
     </TooltipProvider>,
   );
   return {
@@ -719,4 +725,16 @@ describe("WorkspacePanel browser tab", () => {
     // And the file scope views are not mounted in that branch.
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
   });
+});
+
+it("right-clicking an inactive file tab acts on that file without switching or closing it", () => {
+  const { openFileViewer, onCloseFile } = renderWorkspace({
+    openFiles: ["src/active.ts", "docs/other.md"],
+    selectedFilePath: "src/active.ts",
+  });
+  fireEvent.contextMenu(screen.getByTitle("docs/other.md"));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Copy Path" }));
+  expect(copyText).toHaveBeenCalledWith("/workspace/docs/other.md");
+  expect(openFileViewer).not.toHaveBeenCalled();
+  expect(onCloseFile).not.toHaveBeenCalled();
 });
