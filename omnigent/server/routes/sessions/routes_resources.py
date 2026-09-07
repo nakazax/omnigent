@@ -2507,6 +2507,42 @@ def register_resources_routes(
             runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
         )
 
+    @router.post(
+        "/sessions/{session_id}/resources/github/preferences",
+        response_model=None,
+    )
+    async def set_session_github_preference(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Apply the GitHub panel's account / remote selection for a session.
+
+        Persists the choice on the runner — ``gh repo set-default`` for the base
+        repo, and a per-repo account preference in the user config — then returns
+        the refreshed ``session.github.info``. Requires the runner online: the
+        selection mutates ``gh`` / git state the host-offline reader can't write.
+
+        :param request: The incoming FastAPI request (JSON body + auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The refreshed ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        status, result = await _proxy_post_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/resources/github/preferences",
+            {"account": body.get("account"), "remote": body.get("remote")},
+            conv,
+        )
+        if status >= 400:
+            error = result.get("error", {})
+            raise OmnigentError(
+                error.get("message", f"GitHub preference update failed (HTTP {status})"),
+                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        return result
+
     # Generic single-resource lookup — registered AFTER typed
     # collections so "environments", "terminals", "files" are not
     # captured as resource_id.

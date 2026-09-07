@@ -13,7 +13,7 @@
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   isRunnerUnavailable503,
@@ -60,6 +60,23 @@ export interface GithubRepo {
   name_with_owner: string | null;
 }
 
+/** A `gh`-configured account — one option in the panel's account selector. */
+export interface GithubAccount {
+  login: string;
+  /** Whether this is gh's currently-active account for the host. */
+  active: boolean;
+  /** gh's per-account validation state, e.g. "success" (null on old gh). */
+  state: string | null;
+  host: string | null;
+}
+
+/** A git remote — one option in the panel's base-repo selector. */
+export interface GithubRemote {
+  name: string;
+  /** `owner/repo` derived from the remote URL, or null when unparseable. */
+  owner_repo: string | null;
+}
+
 /** Why the panel can't show GitHub content.
  *  - `not_a_git_repo` — the workspace exists but isn't a git checkout.
  *  - `no_os_env` — no workspace/filesystem to read (404 from a current host).
@@ -84,6 +101,15 @@ export interface GithubInfo {
   /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
   pr?: GithubPr | null;
+  /** Configured gh accounts (the account selector's options). */
+  accounts?: GithubAccount[];
+  /** The repo's git remotes (the base-repo selector's options). */
+  remotes?: GithubRemote[];
+  /** The login gh runs as for this repo — the per-repo preference, else the
+   *  active account. */
+  selected_account?: string | null;
+  /** The gh-resolved base repo as `owner/repo`, or null when none is set. */
+  default_remote?: string | null;
 }
 
 /** A file changed on the branch relative to its base. Same shape as the
@@ -243,6 +269,54 @@ export function useGithubInfo(conversationId: string | undefined, options?: { po
     staleTime: 30_000,
     refetchInterval: options?.poll ? (query) => computeGithubPollInterval(query.state.data) : false,
     refetchIntervalInBackground: false,
+  });
+}
+
+/** The account (a gh login) and/or base repo (a git remote name or `owner/repo`)
+ *  to pin for this session's workspace. Either may be omitted to leave it as-is;
+ *  an empty `account` clears the per-repo preference. */
+export interface GithubPreferenceInput {
+  account?: string;
+  remote?: string;
+}
+
+async function postGithubPreference(
+  conversationId: string,
+  body: GithubPreferenceInput,
+): Promise<GithubInfo> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/preferences`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (res.status === 503 && (await isRunnerUnavailable503(res))) {
+    throw new RunnerOfflineError();
+  }
+  if (!res.ok) throw await errorFromResponse(res);
+  return (await res.json()) as GithubInfo;
+}
+
+/**
+ * Apply the panel's account / base-repo selection for a session.
+ *
+ * The runner persists the choice (`gh repo set-default` for the base repo; a
+ * per-repo account preference in the user config) and returns the refreshed
+ * info, which we seed straight into the `github-info` cache. Because a different
+ * account/base can resolve a different PR, the PR-derived queries (changed files,
+ * whole-PR diff) are invalidated so they refetch. Requires the runner online.
+ */
+export function useSetGithubPreference(conversationId: string | undefined) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: GithubPreferenceInput) => postGithubPreference(conversationId!, body),
+    onSuccess: (info) => {
+      queryClient.setQueryData(["github-info", conversationId], info);
+      queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
+    },
   });
 }
 

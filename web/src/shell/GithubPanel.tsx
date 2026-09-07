@@ -51,6 +51,13 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -60,6 +67,7 @@ import {
   useGithubChangedFiles,
   useGithubInfo,
   useGithubPrDiff,
+  useSetGithubPreference,
   type GithubChangedFile,
   type GithubCheckRun,
   type GithubInfo,
@@ -78,22 +86,111 @@ function PanelMessage({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Full-panel empty state: an icon, a title, and an optional hint line. Used
- *  for every "no GitHub content to show" reason so they read as one family. */
+/** Full-panel empty state: an icon, a title, an optional hint line, and optional
+ *  children below (the account/remote selectors). Used for every "no GitHub
+ *  content to show" reason so they read as one family. */
 function GithubEmptyState({
   icon: Icon,
   title,
   hint,
+  children,
 }: {
   icon: LucideIcon;
   title: React.ReactNode;
   hint?: React.ReactNode;
+  children?: React.ReactNode;
 }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
       <Icon className="size-8 text-muted-foreground/50" />
       <p className="text-ui font-medium text-foreground">{title}</p>
       {hint && <p className="max-w-xs text-ui text-muted-foreground">{hint}</p>}
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Account + base-repo selectors that pin how the panel resolves this session's
+ * PR. They replace the panel's old implicit guesses: `gh`'s active account (the
+ * account dropdown) and its base-repo resolution (the remote dropdown, applied
+ * via `gh repo set-default`). Each renders only when there's a real choice — a
+ * single-account / single-remote checkout shows nothing and keeps working with
+ * zero config. Shown in the failing empty states (so a wrong account/base can be
+ * corrected) and, compactly, in the ready header.
+ */
+function GithubSelectors({
+  conversationId,
+  info,
+  compact = false,
+}: {
+  conversationId: string;
+  info: GithubInfo;
+  compact?: boolean;
+}) {
+  const setPref = useSetGithubPreference(conversationId);
+  const accounts = info.accounts ?? [];
+  const remotes = info.remotes ?? [];
+  const showAccount = accounts.length > 1;
+  const showRemote = remotes.length > 1;
+  if (!showAccount && !showRemote) return null;
+
+  const selectedAccount = info.selected_account ?? undefined;
+  // Map the gh-resolved base (owner/repo) back to the remote name the Select is
+  // keyed on, so the current base shows as selected.
+  const selectedRemote =
+    remotes.find((r) => r.owner_repo && r.owner_repo === info.default_remote)?.name ?? undefined;
+  const triggerClass = compact ? "h-6 w-auto gap-1 text-xs" : "h-8 w-full text-ui";
+
+  return (
+    <div
+      className={cn(
+        "flex",
+        compact ? "flex-wrap items-center gap-1.5" : "w-full max-w-xs flex-col gap-2 pt-2",
+      )}
+    >
+      {showAccount && (
+        <Select
+          value={selectedAccount}
+          onValueChange={(login) => setPref.mutate({ account: login })}
+          disabled={setPref.isPending}
+        >
+          <SelectTrigger aria-label="GitHub account" className={triggerClass}>
+            <SelectValue placeholder="Account" />
+          </SelectTrigger>
+          <SelectContent>
+            {accounts.map((a) => (
+              <SelectItem key={a.login} value={a.login}>
+                {a.login}
+                {a.active ? " (active)" : ""}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
+      {showRemote && (
+        <Select
+          value={selectedRemote}
+          onValueChange={(name) => setPref.mutate({ remote: name })}
+          disabled={setPref.isPending}
+        >
+          <SelectTrigger aria-label="Base repository" className={triggerClass}>
+            <SelectValue placeholder="Repository" />
+          </SelectTrigger>
+          <SelectContent>
+            {remotes.map((r) => (
+              <SelectItem key={r.name} value={r.name}>
+                {r.owner_repo ?? r.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
+      {setPref.isError && !compact && (
+        <p className="text-ui text-red-600 dark:text-red-400">
+          Couldn’t apply: {(setPref.error as Error).message}
+        </p>
+      )}
     </div>
   );
 }
@@ -754,11 +851,14 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           title="Can’t reach the upstream repo"
           hint={
             <>
-              Run <span className="font-mono">gh auth status</span> on the host to confirm the
-              GitHub CLI is signed in to the right account.
+              Pick the account and repository to use, or run{" "}
+              <span className="font-mono">gh auth status</span> on the host to confirm the GitHub
+              CLI is signed in.
             </>
           }
-        />
+        >
+          {info.data && <GithubSelectors conversationId={conversationId} info={info.data} />}
+        </GithubEmptyState>
       );
     case "no-pr":
       // TODO: offer a "Create PR" action here once the panel can open PRs.
@@ -770,8 +870,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               No open PR for <span className="font-mono">{panelState.branch ?? "this branch"}</span>
             </>
           }
-          hint="When you open a pull request for this branch, it’ll show up here."
-        />
+          hint="When you open a pull request for this branch, it’ll show up here. If it’s on a fork or another account, pick it below."
+        >
+          {info.data && <GithubSelectors conversationId={conversationId} info={info.data} />}
+        </GithubEmptyState>
       );
     case "unavailable":
       return (
@@ -805,7 +907,13 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               </>
             )}
           </span>
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          {/* Compact account/base switcher — lets a wrong-but-successful
+              resolution be corrected without leaving the panel. Renders nothing
+              unless there's more than one account or remote to choose from. */}
+          <div className="mt-1 empty:mt-0">
+            <GithubSelectors conversationId={conversationId} info={data} compact />
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
             <a
               href={pr.url}
               target="_blank"

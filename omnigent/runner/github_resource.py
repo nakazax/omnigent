@@ -24,14 +24,16 @@ Design notes:
 - Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
   still uses ``git show`` for full before/after content — a unified-diff blob
   can't drive the viewer's context expansion.
-- The branch→PR lookup resolves in one ``gh`` call, picked by whether the pushed
-  ref (``branch.<name>.merge``) was renamed from the local branch — the mark of
-  a fork / triangular push (Databricks prefixes it with ``<user>/``). Renamed →
-  ``gh pr list --head <pushed-ref>``, which matches the head ref name alone and
-  so finds a fork head a bare ``gh pr view`` misses. Not renamed → a bare ``gh pr
-  view``, which is correct and more precise for same-repo branches and returns
-  nothing for a base branch like ``master`` (``gh pr list --head master`` would
-  wrongly match a stranger's PR whose head merely shares the name).
+- The branch→PR lookup is a single ``gh pr view --json`` (``--json`` avoids the
+  interactive pager and the Projects-classic mis-parse of a bare view). Fork /
+  triangular PRs resolve with no head-ref heuristic once the two coordinates they
+  turn on are set explicitly: the base repo (``gh repo set-default``, which ``gh``
+  stores in ``.git/config`` as ``remote.<name>.gh-resolved``) and the head owner
+  (the authenticated account). The panel surfaces an account + remote selector so
+  the user pins both; a per-repo account preference (``~/.omnigent/config.yaml``)
+  is applied by running each ``gh`` call as the chosen account —
+  ``GH_TOKEN=$(gh auth token --user <login>)`` — outside a sandbox (inside one we
+  keep the single broker identity).
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
 """
@@ -41,11 +43,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
 from typing import Any
 
+from omnigent import config as _config
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -128,17 +132,162 @@ def _in_sandbox() -> bool:
     return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
 
 
-def _gh(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
+def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
     # token in the sandbox/runner env (e.g. a gh-MCP passthrough) can't silently
     # make the panel act as a shared identity. Outside a sandbox (local dev) the
     # env is inherited untouched, so the developer's own gh auth still works.
+    #
+    # ``token`` deliberately re-adds GH_TOKEN to run this one call as a chosen
+    # account (the account selector). It's only ever set outside a sandbox — see
+    # _account_token_for — so it never overrides the sandbox's broker identity.
     env: dict[str, str] | None = None
     if _in_sandbox():
         env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+    if token:
+        env = dict(os.environ) if env is None else env
+        env["GH_TOKEN"] = token
+        env.pop("GITHUB_TOKEN", None)
     return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds(), env=env)
+
+
+# ── Account + remote selection ───────────────────────────────────────────────
+# The panel offers two selectors — a remote (the base repo) and an account (the
+# head owner) — so fork/triangular PRs resolve without any head-ref heuristic:
+# ``gh repo set-default`` pins the base in git config, and a per-repo account
+# preference runs every ``gh`` call as the chosen login. Both enumerations are
+# local (no network); a sandbox has a single identity so the account arm no-ops.
+
+# gh's own remote line shape (see cli/cli git/client.go): ``name url (fetch|push)``.
+_REMOTE_LINE_RE = re.compile(r"^(\S+)\s+(\S+)\s+\((fetch|push)\)$")
+
+
+def _owner_repo_from_url(url: str | None) -> str | None:
+    """Derive ``owner/repo`` from a git remote URL, or ``None``.
+
+    Handles HTTPS/SSH/scp-style GitHub URLs, stripping any ``.git`` suffix.
+    """
+    if not url:
+        return None
+    candidate = url.strip()
+    scp = re.match(r"^[\w.\-]+@[\w.\-]+:(?P<path>.+)$", candidate)
+    if scp:
+        path = scp.group("path")
+    else:
+        scheme = re.match(r"^\w+://(?:[^@/]+@)?[\w.\-]+/(?P<path>.+)$", candidate)
+        if not scheme:
+            return None
+        path = scheme.group("path")
+    parts = path.removesuffix(".git").strip("/").split("/")
+    if len(parts) < 2 or not parts[-1] or not parts[-2]:
+        return None
+    return f"{parts[-2]}/{parts[-1]}"
+
+
+def _list_remotes(root: str) -> list[dict[str, Any]]:
+    """List the workspace's git remotes as ``{name, owner_repo}`` (empty on error).
+
+    Parses ``git remote -v`` the way ``gh`` does, grouping the fetch/push lines by
+    name and deriving ``owner/repo`` (fetch URL preferred) for the base selector.
+    """
+    rc, out, _ = _git(["remote", "-v"], cwd=root)
+    if rc != 0:
+        return []
+    grouped: dict[str, dict[str, str | None]] = {}
+    for line in out.splitlines():
+        match = _REMOTE_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        name, remote_url, kind = match.group(1), match.group(2), match.group(3)
+        entry = grouped.setdefault(name, {"fetch": None, "push": None})
+        entry[kind] = remote_url
+    remotes: list[dict[str, Any]] = []
+    for name, urls in grouped.items():
+        remotes.append(
+            {"name": name, "owner_repo": _owner_repo_from_url(urls["fetch"] or urls["push"])}
+        )
+    return remotes
+
+
+def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
+    """Return ``(authenticated, accounts)`` from ``gh auth status --json hosts``.
+
+    ``accounts`` is ``[{login, active, state, host}]``; ``authenticated`` is true
+    when at least one account validates (``state == "success"``). Falls back to a
+    plain ``gh auth status`` for the boolean on an older ``gh`` without ``--json``.
+    """
+    _, out, _ = _gh(["auth", "status", "--json", "hosts"], cwd=root)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        data = None
+    hosts = data.get("hosts") if isinstance(data, dict) else None
+    if isinstance(hosts, dict):
+        accounts: list[dict[str, Any]] = []
+        for host, entries in hosts.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or not entry.get("login"):
+                    continue
+                accounts.append(
+                    {
+                        "login": entry.get("login"),
+                        "active": bool(entry.get("active")),
+                        "state": entry.get("state"),
+                        "host": entry.get("host") or host,
+                    }
+                )
+        return any(a.get("state") == "success" for a in accounts), accounts
+    # Older gh (no --json hosts): fall back to the plain status exit code.
+    rc, _, _ = _gh(["auth", "status"], cwd=root)
+    return rc == 0, []
+
+
+def _resolved_base_nwo(root: str) -> str | None:
+    """Return the gh-resolved base repo ``owner/repo`` for the checkout, or ``None``.
+
+    Reads ``gh repo set-default --view`` — a local git-config read (no network),
+    the same base ``gh`` itself resolves PRs against. ``None`` when no default is
+    set (``--view`` exits non-zero) or the output isn't an ``owner/repo``.
+    """
+    rc, out, _ = _gh(["repo", "set-default", "--view"], cwd=root)
+    if rc != 0:
+        return None
+    value = out.strip()
+    if value and "/" in value and " " not in value:
+        return value
+    return None
+
+
+def _gh_auth_token(root: str, login: str) -> str | None:
+    """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
+    rc, out, _ = _gh(["auth", "token", "--user", login, "-h", "github.com"], cwd=root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _account_token_for(root: str, base_nwo: str | None = None) -> str | None:
+    """Return the GH_TOKEN to run ``gh`` as this repo's preferred account, or ``None``.
+
+    ``None`` (use ``gh``'s active auth) inside a sandbox (single broker identity),
+    when no base repo resolves, or when the base has no stored account preference.
+
+    :param root: Absolute workspace path.
+    :param base_nwo: Precomputed base ``owner/repo`` to skip a repeat resolution.
+    """
+    if _in_sandbox():
+        return None
+    base = base_nwo if base_nwo is not None else _resolved_base_nwo(root)
+    if not base:
+        return None
+    login = _config.github_account_preference(base)
+    if not login:
+        return None
+    return _gh_auth_token(root, login)
 
 
 # Cap the per-check list so a pathological rollup can't bloat the payload; the
@@ -197,75 +346,19 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
     }
 
 
-def _current_branch(root: str) -> str | None:
-    """Return the workspace's current branch name, or ``None`` (detached / not a repo)."""
-    rc, out, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
-    if rc != 0:
-        return None
-    return out.strip() or None
-
-
-def _pushed_head_ref(root: str, branch: str) -> str | None:
-    """Return ``branch``'s pushed head ref name, or ``None``.
-
-    Reads the configured upstream (``branch.<name>.merge``), whose value is the
-    ref that was actually pushed — which may carry a ``<user>/`` prefix under a
-    fork / triangular push flow and so differ from the local branch name.
-    ``None`` with no upstream configured.
-    """
-    rc, out, _ = _git(["config", f"branch.{branch}.merge"], cwd=root)
-    if rc != 0 or not out.strip():
-        return None
-    return out.strip().removeprefix("refs/heads/") or None
-
-
-def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
+def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[str, Any] | None:
     """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
 
-    Resolves the PR in a single ``gh`` call, choosing the query from a cheap git
-    signal: whether the pushed ref (``branch.<name>.merge``) was *renamed* from
-    the local branch name. A fork / triangular push renames it (Databricks pushes
-    carry a ``<user>/`` prefix), and only then does a bare ``gh pr view`` miss the
-    PR — its head-repo-owner guess looks in the wrong place. There we resolve by
-    the pushed ref with ``gh pr list --head`` (``--json`` takes the same fields,
-    and a row shares the shape of a ``gh pr view`` object, so it parses
-    identically; ``--state all`` keeps merged/closed PRs visible).
+    A single ``gh pr view --json`` resolves the current branch's PR against the
+    gh-resolved base repo as the authenticated account. With the base and account
+    pinned by the panel's selectors, that one call covers fork / triangular and
+    same-repo PRs alike — no head-ref heuristic — and still returns nothing for a
+    base branch with no PR. ``--json`` also avoids the interactive pager and the
+    Projects-classic mis-parse of a bare ``gh pr view``.
 
-    Otherwise a bare ``gh pr view`` is correct and *more precise*: it resolves
-    same-repo and standard-fork PRs, and returns nothing for a base branch like
-    ``master``. Using ``gh pr list --head`` there would be wrong — it matches on
-    the head ref name alone, so on ``master`` it returns a stranger's unrelated
-    PR whose head merely happens to be named ``master``.
+    :param token: Optional GH_TOKEN to run the call as the selected account.
     """
-    branch = _current_branch(root)
-    pushed_ref = _pushed_head_ref(root, branch) if branch is not None else None
-    if pushed_ref is not None and pushed_ref != branch:
-        rc, out, _ = _gh(
-            [
-                "pr",
-                "list",
-                "--head",
-                pushed_ref,
-                "--state",
-                "all",
-                "--limit",
-                "1",
-                "--json",
-                fields,
-            ],
-            cwd=root,
-        )
-        if rc != 0:
-            return None
-        try:
-            rows = json.loads(out)
-        except ValueError:
-            return None
-        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-            return rows[0]
-        return None
-
-    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root)
+    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root, token=token)
     if rc != 0:
         return None
     try:
@@ -287,7 +380,9 @@ def github_info(root: str) -> dict[str, Any]:
     :returns: A ``session.github.info`` object. ``available`` is false only when
         this isn't a git repo (``reason: not_a_git_repo``). ``gh_available`` /
         ``authenticated`` report whether the ``gh`` CLI is present and signed in;
-        ``repo`` / ``pr`` / ``base_ref`` are null without it.
+        ``repo`` / ``pr`` / ``base_ref`` are null without it. ``accounts`` /
+        ``remotes`` list the selector options, with ``selected_account`` and
+        ``default_remote`` the current picks (see :func:`set_github_preference`).
     """
     payload: dict[str, Any] = {"object": "session.github.info"}
 
@@ -311,13 +406,24 @@ def github_info(root: str) -> dict[str, Any]:
         return payload
     payload["gh_available"] = True
 
-    auth_rc, _, _ = _gh(["auth", "status"], cwd=root)
-    authenticated = auth_rc == 0
+    # Enumerate the two selectors' options (all local, no network) and the
+    # current base + account so the panel can render and correct the resolution.
+    authenticated, accounts = _list_accounts(root)
     payload["authenticated"] = authenticated
+    payload["accounts"] = accounts
+    payload["remotes"] = _list_remotes(root)
+    default_remote = _resolved_base_nwo(root)
+    payload["default_remote"] = default_remote
+    pref_login = _config.github_account_preference(default_remote) if default_remote else None
+    active_login = next((a["login"] for a in accounts if a.get("active")), None)
+    payload["selected_account"] = pref_login or active_login
     if not authenticated:
         return payload
 
-    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root)
+    # Run the API-touching calls as the repo's preferred account (local dev only).
+    token = _account_token_for(root, default_remote)
+
+    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root, token=token)
     if rc == 0:
         try:
             data = json.loads(out)
@@ -326,7 +432,7 @@ def github_info(root: str) -> dict[str, Any]:
             pass
 
     pr: dict[str, Any] | None = None
-    data = _pr_view_json(root, _PR_VIEW_FIELDS)
+    data = _pr_view_json(root, _PR_VIEW_FIELDS, token=token)
     if data is not None:
         author = data.get("author")
         pr = {
@@ -345,6 +451,36 @@ def github_info(root: str) -> dict[str, Any]:
     # A pure PR view: the base is the PR's base branch, else null (no PR).
     payload["base_ref"] = pr.get("base_ref") if pr else None
     return payload
+
+
+def set_github_preference(
+    root: str,
+    *,
+    account: str | None = None,
+    remote: str | None = None,
+) -> dict[str, Any]:
+    """Apply an account and/or remote selection, then return refreshed info.
+
+    The remote is applied first (``gh repo set-default``, persisted by ``gh`` in
+    ``.git/config``) so the account preference — keyed by the *new* base repo — is
+    stored against the right key. The account is persisted to the user config via
+    :func:`omnigent.config.set_github_account_preference`; an empty ``account``
+    clears the entry, falling back to ``gh``'s active account.
+
+    :param root: Absolute workspace path.
+    :param account: GitHub login to prefer for this repo, or ``None`` to leave
+        the account unchanged (empty string clears it).
+    :param remote: Git remote name or ``owner/repo`` to set as the base repo, or
+        ``None`` to leave the base unchanged.
+    :returns: The refreshed :func:`github_info` payload.
+    """
+    if remote:
+        _gh(["repo", "set-default", remote], cwd=root)
+    if account is not None:
+        base = _resolved_base_nwo(root)
+        if base:
+            _config.set_github_account_preference(base, account or None)
+    return github_info(root)
 
 
 def resolve_base_ref(root: str, base: str | None) -> str | None:
@@ -400,14 +536,15 @@ _GH_STATUS_MAP = {
 }
 
 
-def _pr_number(root: str) -> int | None:
+def _pr_number(root: str, *, token: str | None = None) -> int | None:
     """Return the PR number for the workspace's branch, or ``None``.
 
     :param root: Absolute workspace path.
+    :param token: Optional GH_TOKEN to run ``gh`` as the selected account.
     :returns: The associated PR's number, or ``None`` when no PR resolves (none
         for the branch, ``gh`` missing, or not authenticated).
     """
-    data = _pr_view_json(root, "number")
+    data = _pr_view_json(root, "number", token=token)
     if data is None:
         return None
     number = data.get("number")
@@ -426,7 +563,8 @@ def github_changed_files(root: str) -> dict[str, Any]:
         / ``status`` / ``lines_added`` / ``lines_removed``.
     """
     empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
-    number = _pr_number(root)
+    token = _account_token_for(root)
+    number = _pr_number(root, token=token)
     if number is None:
         return empty
     # ``{owner}`` / ``{repo}`` are filled by ``gh`` from the repo; ``--paginate``
@@ -434,6 +572,7 @@ def github_changed_files(root: str) -> dict[str, Any]:
     rc, out, _ = _gh(
         ["api", "--paginate", f"repos/{{owner}}/{{repo}}/pulls/{number}/files?per_page=100"],
         cwd=root,
+        token=token,
     )
     if rc != 0:
         return empty
@@ -512,8 +651,9 @@ def github_pr_diff(root: str) -> dict[str, Any]:
         (empty when there's no PR / no changes).
     """
     empty: dict[str, Any] = {"object": "session.github.pr_diff", "patch": ""}
-    number = _pr_number(root)
+    token = _account_token_for(root)
+    number = _pr_number(root, token=token)
     if number is None:
         return empty
-    rc, out, _ = _gh(["pr", "diff", str(number)], cwd=root)
+    rc, out, _ = _gh(["pr", "diff", str(number)], cwd=root, token=token)
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
