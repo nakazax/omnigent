@@ -9050,7 +9050,7 @@ async def test_hook_evaluate_endpoint_returns_deny_hook_output(
 async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upstream failure denies PreToolUse and stays open for PostToolUse."""
+    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
     client = _ScriptedPolicyClient(None)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
@@ -9061,7 +9061,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
             _PRE_TOOL_USE_PAYLOAD,
         )
         output = json.loads(body)
-        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
 
         post_body = await asyncio.to_thread(
             _relay_request_raw,
@@ -9136,7 +9136,7 @@ async def test_curl_evaluate_policy_command_round_trips(
     )
     assert result.returncode == 0, result.stderr
     output = json.loads(result.stdout)
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
 
 

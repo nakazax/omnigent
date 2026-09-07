@@ -4715,7 +4715,7 @@ def _tool_relay_handler_factory(
             # process where these modules are already loaded.
             from omnigent.native_policy_hook import (
                 evaluation_response_to_hook_output,
-                fail_closed_hook_output,
+                fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
             )
 
@@ -4773,7 +4773,7 @@ def _tool_relay_handler_factory(
                     last_error,
                     extra={"session_id": session_id},
                 )
-                self._respond_hook_output(fail_closed_hook_output(hook_event, last_error))
+                self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
                 return
             hook_output = evaluation_response_to_hook_output(hook_event, verdict)
             decision = (
