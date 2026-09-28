@@ -3,7 +3,7 @@
 // this machine's host), so a browser tab or a remote session sees no change.
 
 import { FolderOpenIcon } from "lucide-react";
-import { createContext, useContext, useEffect, useState, type MouseEvent } from "react";
+import { createContext, useContext, useState, useSyncExternalStore, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import {
@@ -12,7 +12,12 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { getHostIdentity, revealFile, supportsFileReveal } from "@/lib/nativeBridge";
+import {
+  getHostIdentity,
+  onHostStatusChanged,
+  revealFile,
+  supportsFileReveal,
+} from "@/lib/nativeBridge";
 import { FileViewerContext } from "./FileViewerContext";
 
 /** Folder the Files tree is browsing; its row paths are relative to it. */
@@ -24,24 +29,35 @@ export interface RevealTarget {
   path: string;
 }
 
-// This machine's host id, read once per window.
-let cachedHostId: string | null | undefined;
-let hostIdRequest: Promise<string | null> | undefined;
+// This machine's host id, re-read whenever the host's status changes: a fresh
+// install has none until its first host connection.
+let localHostId: string | null = null;
+let watchingHost = false;
+const hostIdListeners = new Set<() => void>();
+
+function readLocalHostId() {
+  void getHostIdentity().then((identity) => {
+    const next = identity?.hostId ?? null;
+    if (next === localHostId) return;
+    localHostId = next;
+    hostIdListeners.forEach((listener) => listener());
+  });
+}
+
+function subscribeToHostId(listener: () => void) {
+  if (!watchingHost && supportsFileReveal()) {
+    watchingHost = true;
+    readLocalHostId();
+    onHostStatusChanged(readLocalHostId);
+  }
+  hostIdListeners.add(listener);
+  return () => {
+    hostIdListeners.delete(listener);
+  };
+}
 
 function useLocalHostId(): string | null {
-  const [hostId, setHostId] = useState(cachedHostId ?? null);
-  useEffect(() => {
-    if (cachedHostId !== undefined || !supportsFileReveal()) return;
-    let live = true;
-    hostIdRequest ??= getHostIdentity().then((identity) => {
-      cachedHostId = identity?.hostId ?? null;
-      return cachedHostId;
-    });
-    void hostIdRequest.then((id) => live && setHostId(id));
-    return () => {
-      live = false;
-    };
-  }, []);
+  const hostId = useSyncExternalStore(subscribeToHostId, () => localHostId);
   return supportsFileReveal() ? hostId : null;
 }
 
